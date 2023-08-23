@@ -1,3 +1,8 @@
+from nets import *
+from utils import *
+import torchvision
+import torchvision.transforms as transforms
+import os.path
 import matplotlib.pyplot as plt
 parameters = {
                     # 'axes.labelsize': 15,
@@ -13,21 +18,32 @@ from matplotlib import image
 import torch as t
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
-from config import svhn_config
-from nets import weights_init
-from dataset import get_dataset
-from utils import *
-from pygrid_utils import *
 from torch.autograd import Variable
 import numpy as np
 import random
 import itertools
 import datetime
 import argparse
+from collections import OrderedDict
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-grid_log_init = {'Broken': 'False', 'Broken_epoch': 0, 'fid_best_syn': 0., 'fid_best_ep': 0}
 mse = nn.MSELoss(reduction='sum').cuda()
+svhn_config = {
+    'dataset': 'svhn',
+    'img_size': 32,
+    'normalize_data': True,
+}
+
+
+def get_dataset(args):
+    data_dir = '/data4/jcui7/images/data/' if 'Tian-ds' not in __file__ else '/Tian-ds/jcui7/HugeData/'
+    transform = transforms.Compose(
+        [transforms.Resize(args.img_size), transforms.ToTensor(),
+         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+    ds_train = torchvision.datasets.SVHN(data_dir + 'svhn', download=True, split='extra', transform=transform)
+    ds_val = torchvision.datasets.SVHN(data_dir + 'svhn', download=True, split='test', transform=transform)
+    input_shape = [3, args.img_size, args.img_size]
+    return ds_train, ds_val, input_shape
+
 
 def show_multiple_images(img_list, path_dir, imgs_dir, labels=None):
     def show(imgs, path, labels):
@@ -94,7 +110,6 @@ def langevin_prior(zs_init, netE, args, should_print=True):
 
         for i, z in enumerate(zs):
             z.data += 0.5 * e_l_step_size * e_l_step_size * (en_grad[i] - z.data)
-
             z.data += e_l_step_size * t.randn_like(z)
 
         if (k % 5 == 0 or k == e_l_steps - 1) and should_print:
@@ -143,61 +158,23 @@ def recon_x(x, netG, netI):
 
 def fit(netG, netE, netI, dl_train, test_batch, args, logger):
 
-    def eval_flag():
-        netG.eval()
-        netE.eval()
-        netI.eval()
-        # requires_grad(netG, False)
-        # requires_grad(netE, False)
-        # requires_grad(netI, False)
-
-    def train_flag():
-        netG.train()
-        netE.train()
-        netI.train()
-        # requires_grad(netG, True)
-        # requires_grad(netE, True)
-        # requires_grad(netI, True)
-
-    # optG = t.optim.Adam(netG.parameters(), lr=args.lrG, weight_decay=args.g_decay, betas=(args.beta1G, 0.9))
     optE = t.optim.Adam(netE.parameters(), lr=args.lrE, weight_decay=args.e_decay, betas=(args.beta1E, 0.9))
     opt = t.optim.Adam(list(netI.parameters())+list(netG.parameters()), lr=args.lrG, weight_decay=args.g_decay, betas=(args.beta1G, 0.9))
     lrE_schedule = t.optim.lr_scheduler.ExponentialLR(optE, args.e_gamma)
     lr_schedule = t.optim.lr_scheduler.ExponentialLR(opt, args.i_gamma)
-
-    import math
-    fid_best_syn = math.inf
-    fid_best_ep = 0
-    to_range_0_1 = lambda x: (x + 1.) / 2. if args.normalize_data else x
-    log_iter = int(len(dl_train) // 2) if len(dl_train) > 1000 else int(len(dl_train) // 1)
-
-    fid_ds = []
-    for j in range(50000 // args.batch_size):
-        fix_x = next(iter(dl_train))
-        fid_batch = fix_x[0].to(args.device) if type(fix_x) is list else fix_x.to(args.device)
-        fid_batch = to_range_0_1(fid_batch).clamp(min=0., max=1.)
-        fid_ds.append(fid_batch)
-    fid_ds = t.cat(fid_ds)
+    log_iter = 500
 
     for ep in range(args.epochs):
         lrE_schedule.step(epoch=ep)
-        # lrG_schedule.step(epoch=ep)
         lr_schedule.step(epoch=ep)
 
         for i, x in enumerate(dl_train, 0):
-            if i % log_iter == 0:
-                logger.info(
-                    "==" * 10 + f"ep: {ep} batch: [{i}/{len(dl_train)}] best_fid_syn: {fid_best_syn:.3f} best_fid_ep: {fid_best_ep}" + "==" * 10)
+            training_log = f"[{ep}/{args.epochs}][{i}/{len(dl_train)}] \n"
 
-            training_log = f"[{ep}/{args.epochs}][{i}/{len(dl_train)}] best_fid_syn: {fid_best_syn:.3f} fid best ep: {fid_best_ep} \n"
-
-            train_flag()
             x = x[0].to(args.device) if type(x) is list else x.to(args.device)
             batch_size = x.shape[0]
 
             opt.zero_grad()
-            # optG.zero_grad()
-            # optE.zero_grad()
             z0_q_mean, z0_q_logvar, z1_q_mean, z1_q_logvar, z2_q_mean, z2_q_logvar, z3_q_mean, z3_q_logvar = netI(x)
             z0_q = reparametrize(z0_q_mean, z0_q_logvar)
             z1_q = reparametrize(z1_q_mean, z1_q_logvar)
@@ -219,8 +196,6 @@ def fit(netG, netE, netI, dl_train, test_batch, args, logger):
                             f'z2_KL: {z2_kl.item():.3f} z3_KL: {z2_kl.item():.3f}\n'
             loss.backward()
             opt.step()
-            # optG.step()
-            # optE.step()
 
             optE.zero_grad()
             z_e_0 = sample_z0(args)
@@ -245,113 +220,204 @@ def fit(netG, netE, netI, dl_train, test_batch, args, logger):
                 os.makedirs(syn_imgs_dir, exist_ok=True)
                 show_single_batch(sample_x(netG, netE, args), syn_imgs_dir + f'{ep * len(dl_train) + i:>07d}.png', nrow=10)
 
-                if not args.fid:
-                    os.makedirs(args.dir + '/ckpt', exist_ok=True)
-                    save_dict = {
-                        'epoch': ep,
-                        'netG': netG.state_dict(),
-                        'netE': netE.state_dict(),
-                        'netI': netI.state_dict(),
-                        'opt': opt.state_dict(),
-                        'optE': optE.state_dict(),
-                    }
-                    t.save(save_dict, '{}/{}.pth'.format(args.dir + '/ckpt', ep * len(dl_train) + i))
-                    keep_last_ckpt(path=args.dir + '/ckpt/', num=30)
-
-            if t.isnan(et.mean()) or t.isnan(ef.mean()) or e_loss.item() > 1e3 or e_loss.item() < -1e3:
-                logger.info("Got NaN at ep {} iter {}".format(ep, i))
-                logger.info(training_log)
-                return ['True', ep, fid_best_syn, fid_best_ep]
-
-        if args.fid and ep >= args.n_metrics_start and ep % args.n_metrics == 0:
-            from pytorch_fid_jcui7.fid_score import compute_fid
-            from tqdm import tqdm
-            try:
-                s1 = []
-                for _ in tqdm(range(int(50000 / args.batch_size))):
-                    syn = sample_x(netG, netE, args).detach()
-                    syn_corr = to_range_0_1(syn).clamp(min=0., max=1.)
-                    s1.append(syn_corr)
-                s1 = t.cat(s1)
-                fid = compute_fid(x_train=fid_ds, x_samples=s1, path=None)
-                logger.info(f'fid gen: {fid:.5f}')
-
-                if fid < fid_best_syn:
-                    fid_best_syn = fid
-                    fid_best_ep = ep
-                    os.makedirs(args.dir + '/ckpt', exist_ok=True)
-                    save_dict = {
-                        'epoch': ep,
-                        'netG': netG.state_dict(),
-                        'netE': netE.state_dict(),
-                        'netI': netI.state_dict(),
-                        'opt': opt.state_dict(),
-                        'optE': optE.state_dict(),
-                    }
-                    t.save(save_dict, '{}/{:.4f}_{}.pth'.format(args.dir + '/ckpt', fid, ep))
-
-                # if fid > fid_best_syn + 5:
-                #     return ['True', ep, fid_best_syn, fid_best_ep]
-
-            except Exception as e:
-                print(e)
-                logger.critical(e, exc_info=True)
-
-    return ['False', args.epochs, fid_best_syn, fid_best_ep]
+                os.makedirs(args.dir + '/ckpt', exist_ok=True)
+                save_dict = {
+                    'epoch': ep,
+                    'netG': netG.state_dict(),
+                    'netE': netE.state_dict(),
+                    'netI': netI.state_dict(),
+                    'opt': opt.state_dict(),
+                    'optE': optE.state_dict(),
+                }
+                t.save(save_dict, '{}/{}.pth'.format(args.dir + '/ckpt', ep * len(dl_train) + i))
+                keep_last_ckpt(path=args.dir + '/ckpt/', num=30)
+    return
 
 
 def build_netG(args):
-    if args.G_type == 'svhn_4layers_v1':
-        from nets import _generation_svhn_4layers_v1 as _netG
-        netG = _netG(z_dim=[args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim], ngf=args.cs)
-        netG.apply(weights_init)
-        netG.to(args.device)
-    elif args.G_type == 'svhn_4layers_v2':
-        from nets import _generation_svhn_4layers_v2 as _netG
-        netG = _netG(z_dim=[args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim], ngf=args.cs)
-        netG.apply(weights_init)
-        netG.to(args.device)
-    elif args.G_type == 'svhn_4layers_v3':
-        from nets import _generation_svhn_4layers_v3 as _netG
-        netG = _netG(z_dim=[args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim], ngf=args.cs)
-        netG.apply(weights_init)
-        netG.to(args.device)
-    elif args.G_type == 'svhn_4layers_v4':
-        from nets import _generation_svhn_4layers_v4 as _netG
-        netG = _netG(z_dim=[args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim], ngf=args.cs)
-        netG.apply(weights_init)
-        netG.to(args.device)
-    else:
-        raise Exception("choose G type")
+    class _generation_4layers(nn.Module):
+        def __init__(self, z_dim, ngf):
+            super().__init__()
+            self.ngf = ngf
+            self.z_dim = z_dim
+
+            self.gen3 = nn.Sequential(
+                nn.Linear(z_dim[3], ngf[4]),
+                nn.LeakyReLU(0.2),
+                nn.Linear(ngf[4], ngf[4]),
+                nn.LeakyReLU(0.2),
+                nn.Linear(ngf[4], ngf[3]),
+            )
+
+            self.latent2_act = nn.Sequential(
+                nn.Linear(z_dim[2], ngf[3]),
+            )
+
+            self.gen2 = nn.Sequential(
+                nn.Linear(ngf[3], 4 * 4 * ngf[3]),
+                nn.LeakyReLU(0.2),
+                reshape(ngf[3], 4, 4),
+                nn.ConvTranspose2d(ngf[3], ngf[3], 4, 2, 1, bias=False),
+                nn.LeakyReLU(0.2),
+                nn.ConvTranspose2d(ngf[3], ngf[2], 3, 1, 1, bias=False),
+            )
+
+            self.latent1_act = nn.Sequential(
+                nn.Linear(z_dim[1], 8 * 8 * ngf[2]),
+                reshape(ngf[2], 8, 8),
+            )
+
+            self.gen1 = nn.Sequential(
+                nn.ConvTranspose2d(ngf[2], ngf[2], 4, 2, 1, bias=False),
+                nn.LeakyReLU(0.2),
+                nn.ConvTranspose2d(ngf[2], ngf[1], 3, 1, 1, bias=False),
+            )
+
+            self.latent0_act = nn.Sequential(
+                nn.Linear(z_dim[0], 16 * 16 * ngf[1]),
+                reshape(ngf[1], 16, 16),
+            )
+
+            self.gen0 = nn.Sequential(
+                nn.ConvTranspose2d(ngf[1], ngf[1], 4, 2, 1, bias=False),
+                nn.LeakyReLU(0.2),
+                nn.ConvTranspose2d(ngf[1], 3, 3, 1, 1, bias=False),
+                nn.Tanh()
+            )
+
+        def forward(self, zs):
+            z0, z1, z2, z3 = zs[0], zs[1], zs[2], zs[3]
+            tlatent3 = self.gen3(z3)
+            z2_activated = self.latent2_act(z2)
+            tlatent2 = self.gen2(tlatent3 + z2_activated)
+
+            z1_activated = self.latent1_act(z1)
+            tlatent1 = self.gen1(tlatent2 + z1_activated)
+
+            z0_activated = self.latent0_act(z0)
+            tlatent0 = self.gen0(tlatent1 + z0_activated)
+
+            out = tlatent0
+            return out
+
+    netG = _generation_4layers(z_dim=[args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim], ngf=args.cs)
+    netG.apply(weights_init)
+    netG.to(args.device)
     return netG
 
 
 def build_netE(args):
-    if args.E_type == 'v1':
-        from nets import energy_model as _netE
-        netE = _netE(z_dim=sum([args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim]), num_layers=args.en_layers, ndf=args.en_ndf)
-        netE.apply(weights_init)
-        netE.to(args.device)
-    else:
-        raise Exception("choose E type")
-    if args.add_sn:
-        netE = add_sn(netE)
+    class energy_model(nn.Module):
+        def __init__(self, z_dim, num_layers, ndf):
+            super().__init__()
+            self.z_dim = z_dim
+            current_dims = self.z_dim
+            layers = OrderedDict()
+            for i in range(num_layers):
+                layers['fc{}'.format(i + 1)] = nn.Linear(current_dims, ndf)
+                layers['lrelu{}'.format(i + 1)] = nn.LeakyReLU(0.2)
+                current_dims = ndf
+
+            layers['out'] = nn.Linear(current_dims, 1)
+            self.energy = nn.Sequential(layers)
+
+        def forward(self, zs):
+            z = t.cat(zs, dim=1)
+            assert z.shape[1] == self.z_dim
+            z = z.view(-1, self.z_dim)
+            en = self.energy(z).squeeze(1)
+            return en
+
+    netE = energy_model(z_dim=sum([args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim]), num_layers=args.en_layers, ndf=args.en_ndf)
+    netE.apply(weights_init)
+    netE.to(args.device)
+    netE = add_sn(netE)
     return netE
 
 
 def build_netI(args):
-    if args.I_type == 'svhn_4layers_v1':
-        from nets import _inference_svhn_4layer_v1 as _netI
-        netI = _netI(z_dim=[args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim], nif=args.cs)
-        netI.apply(weights_init)
-        netI.to(args.device)
-    else:
-        raise Exception("choose I type")
+    class _inference_4layer(nn.Module):
+        def __init__(self, z_dim, nif):
+            super().__init__()
+            self.nif = nif
+            self.z_dim = z_dim
+            self.ladder0 = nn.Sequential(
+                conv2d_relu(3, nif[1], downsample=True),
+                conv2d_relu(nif[1], nif[1], downsample=False),
+                reshape(nif[1] * 16 * 16),
+            )
+            self.ladder0_mean = nn.Linear(nif[1] * 16 * 16, z_dim[0])
+            self.ladder0_logvar = nn.Linear(nif[1] * 16 * 16, z_dim[0])
+
+            self.inference0 = nn.Sequential(
+                conv2d_relu(3, nif[1], downsample=True),
+                conv2d_relu(nif[1], nif[1], downsample=False)
+            )
+
+            self.ladder1 = nn.Sequential(
+                conv2d_relu(nif[1], nif[2], downsample=True),
+                conv2d_relu(nif[2], nif[2], downsample=False),
+                reshape(nif[2] * 8 * 8)
+            )
+            self.ladder1_mean = nn.Linear(nif[2] * 8 * 8, z_dim[1])
+            self.ladder1_logvar = nn.Linear(nif[2] * 8 * 8, z_dim[1])
+
+            self.inference1 = nn.Sequential(
+                conv2d_relu(nif[1], nif[2], downsample=True),
+                conv2d_relu(nif[2], nif[2], downsample=False),
+            )
+
+            self.ladder2 = nn.Sequential(
+                conv2d_relu(nif[2], nif[3], downsample=True),
+                conv2d_relu(nif[3], nif[3], downsample=False),
+                reshape(nif[3] * 4 * 4)
+            )
+            self.ladder2_mean = nn.Linear(nif[3] * 4 * 4, z_dim[2])
+            self.ladder2_logvar = nn.Linear(nif[3] * 4 * 4, z_dim[2])
+
+            self.inference2 = nn.Sequential(
+                conv2d_relu(nif[2], nif[3], downsample=True),
+                conv2d_relu(nif[3], nif[3], downsample=False),
+            )
+
+            self.ladder3 = nn.Sequential(
+                reshape(nif[3] * 4 * 4),
+                fc_relu(nif[3] * 4 * 4, nif[4]),
+                fc_relu(nif[4], nif[4])
+            )
+            self.ladder3_mean = nn.Linear(nif[4], z_dim[3])
+            self.ladder3_logvar = nn.Linear(nif[4], z_dim[3])
+
+        def forward(self, x):
+            z0_hidden = self.ladder0(x)
+            z0_mean = self.ladder0_mean(z0_hidden)
+            z0_logvar = self.ladder0_logvar(z0_hidden)
+
+            ilatent1 = self.inference0(x)
+            z1_hidden = self.ladder1(ilatent1)
+            z1_mean = self.ladder1_mean(z1_hidden)
+            z1_logvar = self.ladder1_logvar(z1_hidden)
+
+            ilatent2 = self.inference1(ilatent1)
+            z2_hidden = self.ladder2(ilatent2)
+            z2_mean = self.ladder2_mean(z2_hidden)
+            z2_logvar = self.ladder2_logvar(z2_hidden)
+
+            ilatent3 = self.inference2(ilatent2)
+            z3_hidden = self.ladder3(ilatent3)
+            z3_mean = self.ladder3_mean(z3_hidden)
+            z3_logvar = self.ladder3_logvar(z3_hidden)
+
+            return z0_mean, z0_logvar, z1_mean, z1_logvar, z2_mean, z2_logvar, z3_mean, z3_logvar
+
+    netI = _inference_4layer(z_dim=[args.z0_dim, args.z1_dim, args.z2_dim, args.z3_dim], nif=args.cs)
+    netI.apply(weights_init)
+    netI.to(args.device)
+
     return netI
 
 
-def letgo(args_job, output_dir, return_dict):
-
+def letgo(args_job, output_dir):
     set_seeds(1234)
     args = parse_args()
     args = overwrite_opt(args, args_job)
@@ -361,7 +427,7 @@ def letgo(args_job, output_dir, return_dict):
 
     [os.makedirs(args.dir + f'{f}/', exist_ok=True) for f in ['ckpt', 'imgs']]
 
-    logger = Logger(args.dir, f"job{args.job_id}")
+    logger = Logger(args.dir, f"job0")
     logger.info('Config')
     logger.info(args)
 
@@ -385,52 +451,10 @@ def letgo(args_job, output_dir, return_dict):
     logger.info(f"netE params: {compute_model_params(netE)}")
     logger.info(f"netI params: {compute_model_params(netI)}")
 
-    return_list = fit(netG, netE, netI, dl_train, test_batch, args, logger)
+    fit(netG, netE, netI, dl_train, test_batch, args, logger)
 
-    log_stat = {}
-    for grid_log_key, return_value in zip(grid_log_init.keys(), return_list):
-        log_stat[grid_log_key] = return_value
-    return_dict['stats'] = log_stat
     return
 
-def update_job_result(job_opt, job_stats):
-    # TODO add your result metric here
-    for grid in grid_log_init.keys():
-        job_opt[grid] = job_stats[grid]
-
-def create_args_grid():
-    # TODO add your enumeration of parameters here
-    args_dict = {
-        'add_sn': [True],
-        'Gfactor': [3.0],
-        'en_layers': [3, 4],
-        'en_ndf': [50],
-        'lrE': [2e-6],
-        'e_l_steps': [60],
-        'e_l_step_size': [0.4],
-        'cs': [[3, 32, 64, 64, 256]],
-        'z3_dim': [10],
-        'z2_dim': [2],
-        'z1_dim': [2],
-        'z0_dim': [2],
-    }
-    args_list = list(args_dict.values())
-
-    opt_list = []
-
-    for i, args in enumerate(itertools.product(*args_list)):
-        opt_job = {'job_id': int(i), 'status': 'open'}
-        v = [args[i] for i in range(len(args_list))]
-        k = args_dict.keys()
-        opt_args = dict(zip(k, v))
-        # opt_args.update({'mcmc_temp': (opt_args['e_n_step_size']/opt_args['e_l_step_size'])**2})
-        # opt_args.update({'z0_dim': opt_args['z2_dim']})
-        # opt_args.update({'z1_dim': opt_args['z2_dim']})
-        # TODO add your result metric here
-        opt_result = grid_log_init
-        opt_list += [merge_dicts(opt_job, opt_args, opt_result)]
-
-    return opt_list
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -438,30 +462,23 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=100)
 
-    parser.add_argument('--G_type', type=str, default='svhn_4layers_v4', help='svhn_4layers_v1, svhn_4layers_v2')
-    parser.add_argument('--E_type', type=str, default='v1', help='v1')
-    parser.add_argument('--I_type', type=str, default='svhn_4layers_v1', help='svhn_4layers_v1')
-
-    parser.add_argument('--lrE', type=float, default=1e-4, help='learning rate for E, default=0.0002')
+    parser.add_argument('--lrE', type=float, default=2e-6, help='learning rate for E, default=0.0002')
     parser.add_argument('--lrG', type=float, default=3e-4, help='learning rate for GI, default=0.0002')
     parser.add_argument('--lrI', type=float, default=1e-4, help='learning rate for GI, default=0.0002')
 
-    parser.add_argument('--Gfactor', type=float, default=5.0)
+    parser.add_argument('--Gfactor', type=float, default=3.0)
 
-    parser.add_argument('--en_layers', type=int, default=2)
-    parser.add_argument('--en_ndf', type=int, default=100)
+    parser.add_argument('--en_layers', type=int, default=4)
+    parser.add_argument('--en_ndf', type=int, default=50)
     parser.add_argument('--e_l_steps', type=int, default=60)
     parser.add_argument('--e_l_step_size', type=float, default=4e-1)
 
-    # parser.add_argument('--cs', type=list,  default=[3, 32, 64, 128, 1024])
-    parser.add_argument('--cs', type=list,  default=[3, 16, 32, 32, 1024])
+    parser.add_argument('--cs', type=list,  default=[3, 32, 64, 64, 256])
 
-    parser.add_argument("--add_sn", type=bool, default=False)
-
-    parser.add_argument('--z0_dim', type=int, default=5, help='size of the latent z vector') # 100
-    parser.add_argument('--z1_dim', type=int, default=5, help='size of the latent z vector') # 100
-    parser.add_argument('--z2_dim', type=int, default=5, help='size of the latent z vector') # 100
-    parser.add_argument('--z3_dim', type=int, default=40, help='size of the latent z vector') # 100
+    parser.add_argument('--z0_dim', type=int, default=2, help='size of the latent z vector') # 100
+    parser.add_argument('--z1_dim', type=int, default=2, help='size of the latent z vector') # 100
+    parser.add_argument('--z2_dim', type=int, default=2, help='size of the latent z vector') # 100
+    parser.add_argument('--z3_dim', type=int, default=10, help='size of the latent z vector') # 100
 
     parser.add_argument('--beta1E',  type=float, default=0., help='beta1 for adam. default=0.5')
     parser.add_argument('--beta1G',  type=float, default=0., help='beta1 for adam GI. default=0.5')
@@ -473,11 +490,6 @@ def parse_args():
     parser.add_argument('--i_gamma', type=float, default=0.998, help='lr decay for I')
     parser.add_argument('--g_gamma', type=float, default=0.998, help='lr decay for G')
 
-    parser.add_argument('--fid', type=bool, default=True)
-    parser.add_argument('--n_metrics', type=int, default=1) #10
-    parser.add_argument('--n_metrics_start', type=int, default=20)
-
-    parser.add_argument('--job_id', type=int, default=0)
     parser.add_argument('--device', type=int, default=0)
     # Parser
     args, unknown = parser.parse_known_args()
@@ -486,6 +498,7 @@ def parse_args():
         parser.print_help()
         sys.exit()
     return args
+
 
 def set_seeds(seed=0, cuda_deterministic=True):
     random.seed(seed)
@@ -501,11 +514,8 @@ def set_seeds(seed=0, cuda_deterministic=True):
         cudnn.deterministic = False
         cudnn.benchmark = True
 
-def main():
-    gpus_num = 2
-    process_num = 1
-    use_pygrid = True
 
+def main():
     output_dir = './{}/'.format(os.path.splitext(os.path.basename(__file__))[0])
     t = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
 
@@ -513,41 +523,10 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(output_dir + 'code/', exist_ok=True)
 
-    [save_file(output_dir, f) for f in
-    ['config.py', 'dataset.py', 'nets.py', 'utils.py', 'pygrid.py', 'pygrid_utils.py',
-     os.path.basename(__file__)]]
+    [save_file(output_dir, f) for f in ['nets.py', 'utils.py', os.path.basename(__file__)]]
 
-    if use_pygrid:
-        import pygrid
-        device_ids = [i for i in range(gpus_num)] * process_num
-        workers = len(device_ids)
-
-        # set devices
-        pygrid.init_mp()
-        pygrid.fill_queue(device_ids)
-
-        # set opts
-        get_opts_filename = lambda exp: output_dir + '{}.csv'.format(exp)
-        exp_id = pygrid.get_exp_id(__file__)
-
-        write_opts = lambda opts: pygrid.write_opts(opts, lambda: open(get_opts_filename(exp_id), mode='w', newline=''))
-        read_opts = lambda: pygrid.read_opts(lambda: open(get_opts_filename(exp_id), mode='r'))
-
-        if not os.path.exists(get_opts_filename(exp_id)):
-            write_opts(create_args_grid())
-        write_opts(pygrid.reset_job_status(read_opts()))
-
-        # set logging
-        logger = Logger(output_dir, 'main')
-        logger.info(f'available devices {device_ids}')
-
-        # run
-        pygrid.run_jobs(logger, exp_id, output_dir, workers, letgo, read_opts, write_opts, update_job_result)
-        logger.info('done')
-
-    else:
-        opt = dict()
-        letgo(opt, output_dir, {})
+    opt = dict()
+    letgo(opt, output_dir)
 
 if __name__ == '__main__':
     main()
